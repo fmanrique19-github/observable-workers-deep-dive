@@ -1,0 +1,104 @@
+import { DoWork, fromWorker, ObservableWorker } from 'observable-webworker';
+import { asyncScheduler, combineLatest, Observable, Subject } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+import { distinctUntilChanged, map, observeOn, shareReplay, startWith, switchMap } from 'rxjs/operators';
+import { SearchResults, WorkerInput } from '../common/book-search.utils';
+import { MultiWorkerMessage, SearchTermMessage } from './book-search-multi-worker.interfaces';
+
+
+@ObservableWorker()
+export class BookSearchDispatcherWorker
+  implements DoWork<WorkerInput, SearchResults> {
+	  arr: SearchResults[] = [];
+  public work(input$: Observable<WorkerInput>): Observable<SearchResults> {
+    const url$ = input$.pipe(
+      map(({ url }) => url),
+      distinctUntilChanged(),
+    );
+
+    const searchTerm$ = input$.pipe(
+      map(({ searchTerm }) => searchTerm),
+      distinctUntilChanged(),
+      shareReplay(1),
+    );
+
+    const workerCount = 8//navigator.hardwareConcurrency - 2;
+
+    return url$.pipe(
+      switchMap(url => ajax({ url, responseType: 'text' })),
+      map(result => result.response),
+      switchMap((bookText: string) => {
+        const paragraphs = bookText.split('\n\n');
+
+        const workers$ = this.chunkParagraphs(paragraphs, workerCount).map(chunkedParagraphs => {
+          const processorMessages$: Observable<
+            MultiWorkerMessage
+          > = searchTerm$.pipe(
+            map(
+              (searchTerm): SearchTermMessage => ({
+                type: 'SearchTermMessage',
+                payload: searchTerm,
+              }),
+            ),
+            startWith({ type: 'ParagraphsMessage', payload: chunkedParagraphs }),
+          );
+
+          return fromWorker<MultiWorkerMessage, SearchResults>(
+            () =>
+              new Worker('./book-search.processor.worker', { type: 'module' }),
+            processorMessages$,
+          );
+        });
+
+        return combineLatest(workers$).pipe(
+          map((searchResults: SearchResults[]) => {
+            const accumulatedSearchResult = searchResults.reduce((searchResultAccumulated, searchResult) => {
+              searchResultAccumulated.paragraphs.push(...searchResult.paragraphs);
+              searchResultAccumulated.paragraphCount += searchResult.paragraphCount;
+              searchResultAccumulated.searchedParagraphCount += searchResult.searchedParagraphCount;
+
+
+              return searchResultAccumulated;
+            }, {
+              paragraphs: [],
+              searchedParagraphCount: 0,
+              paragraphCount: 0,
+            });
+
+            accumulatedSearchResult.paragraphs.sort((a,b) => b.score-a.score);
+            accumulatedSearchResult.paragraphs.splice(10, Infinity);
+		//console.log("accumulatedSearchResult",accumulatedSearchResult);	
+			
+ //for (let index = 0; index < 10; index++) {
+   //this.arr = [accumulatedSearchResult, ...this.arr];
+
+  // console.log('arr', this.arr)
+ //}
+ 
+
+            return accumulatedSearchResult;
+          })
+        )
+
+      }),
+    );
+  }
+
+  private chunkParagraphs(
+    paragraphs: string[],
+    chunkCount: number,
+  ): string[][] {
+    const chunkSize = Math.floor(paragraphs.length / chunkCount);
+    const chunkedParagraphs = [];
+    for (let i = 0; i < chunkCount; i++) {
+      chunkedParagraphs.push(
+        paragraphs.slice(
+          i * chunkSize,
+          i < chunkCount - 1 ? (i + 1) * chunkSize : undefined,
+        ),
+      );
+    }
+
+    return chunkedParagraphs;
+  }
+}
